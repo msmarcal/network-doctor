@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+"""Diagnose Juju Magpie network results.
+
+Reads `juju status --format json` from a Magpie model, optionally alongside the
+CSV produced by the Magpie iperf action, and reports ranked verdicts about what
+is wrong with the network.
+
+The status message grammar implemented here is the one assembled by
+`check_nodes()` in the reactive Magpie charm, where the workload message is the
+ordered concatenation of six fields: port, bonds, ICMP, local hostname, DNS and
+MTU. The identifiers embedded in the ICMP and DNS clauses are Magpie unit
+identifiers, which this tool resolves to machines before reporting them.
+
+Requires only the Python 3 standard library. Python 3.8 or newer.
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import statistics
+import sys
+
+# Tri-state results. A check is never assumed healthy because it is missing.
+OK = "ok"
+FAILED = "failed"
+ABSENT = "skipped-or-absent"
+
+CHECKS = ("ports", "bonds", "icmp", "hostname", "dns", "mtu")
+
+# Throughput below this fraction of the peer median is treated as an outlier.
+OUTLIER_FRACTION = 0.5
+# Remaining peers must agree within this fraction for the common path to count
+# as verified. Below that they are too scattered to establish a healthy path.
+PEER_CONSISTENCY = 0.75
+# A common path needs at least this many peers measured at the peer rate.
+MIN_PEERS_FOR_ATTRIBUTION = 2
+
+
+# --------------------------------------------------------------------------
+# Stage 1a: status message grammar
+# --------------------------------------------------------------------------
+
+# Each pattern carries the span it consumes, so that whatever is left over can
+# be reported rather than silently dropped.
+RE_PORTS = re.compile(r"ports (ok|failed: .*?), (?=bonds |icmp )")
+RE_BONDS = re.compile(r"bonds (ok|failed: .*?), (?=icmp )")
+RE_ICMP = re.compile(r"icmp (ok|skipped|failed: [^,]*)")
+RE_HOSTNAME = re.compile(r", local hostname (ok|failed) \(([^)]*)\)")
+RE_DNS_OK = re.compile(r", dns ok\b")
+RE_DNS_BAD = re.compile(r", (rev|fwd|match) dns failed: \[([^\]]*)\]")
+RE_MTU_OK = re.compile(r", local mtu ok,\s+required:\s+(\d+)")
+RE_MTU_BAD = re.compile(r", local mtu failed,\s+required:\s+(\d+), iface:\s+(\d+)")
+RE_NET_MTU_OK = re.compile(r", net mtu ok: (\d+)")
+RE_NET_MTU_BAD = re.compile(r", net mtu failed, mismatch: (\S+) packet vs (\d+)\s+on iface (\S+)")
+RE_NET_MTU_CHECK = re.compile(r", network mtu check failed")
+RE_IPERF_LEADER = re.compile(r", iperf leader, mtu: (\d+)")
+RE_SPEED = re.compile(r", [\d.]+ mbit/s")
+RE_SPEED_BAD = re.compile(r", iperf speed check failed")
+RE_MIN_SPEED_BAD = re.compile(r", invalid min_speed: .*")
+
+RE_PEER = re.compile(r"(\d+): (\d+)/(\d+) packets received")
+RE_ID = re.compile(r"\d+")
+
+# Forms that are not check summaries at all.
+RE_LEADER_STATUS = re.compile(r"^Concurrency: \d+ Nodes: ")
+RE_OPS_CHARM = re.compile(r"^Ready, with \d+ peers?$")
+
+
+def _blank(spans, text):
+    """Return the parts of `text` not covered by `spans`, joined and stripped."""
+    spans = sorted(spans)
+    out, cursor = [], 0
+    for start, end in spans:
+        if start > cursor:
+            out.append(text[cursor:start])
+        cursor = max(cursor, end)
+    out.append(text[cursor:])
+    leftover = " ".join(part.strip(" ,") for part in out)
+    return " ".join(leftover.split())
+
+
+def parse_message(message):
+    """Parse one Magpie unit status message into structured check results.
+
+    Every field is extracted independently, so an unrecognized field does not
+    prevent the others from being read. Whatever is not recognized is returned
+    in `unrecognized` and never discarded.
+    """
+    result = {
+        "raw": message,
+        "form": "checks",
+        "checks": dict((name, ABSENT) for name in CHECKS),
+        "detail": {},
+        "icmp_peers": [],
+        "dns_peers": [],
+        "required_mtu": None,
+        "iface_mtu": None,
+        "reported_hostname": None,
+        "unrecognized": "",
+    }
+
+    if RE_OPS_CHARM.match(message.strip()):
+        result["form"] = "ops-charm"
+        return result
+    if RE_LEADER_STATUS.match(message.strip()):
+        result["form"] = "leader-status"
+        return result
+
+    spans = []
+
+    match = RE_PORTS.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["ports"] = OK if match.group(1) == OK else FAILED
+        if match.group(1) != OK:
+            result["detail"]["ports"] = match.group(1)[len("failed: "):]
+
+    match = RE_BONDS.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["bonds"] = OK if match.group(1) == OK else FAILED
+        if match.group(1) != OK:
+            result["detail"]["bonds"] = match.group(1)[len("failed: "):]
+
+    match = RE_ICMP.search(message)
+    if match:
+        spans.append(match.span())
+        value = match.group(1)
+        if value == OK:
+            result["checks"]["icmp"] = OK
+        elif value == "skipped":
+            result["checks"]["icmp"] = ABSENT
+        else:
+            result["checks"]["icmp"] = FAILED
+            for unit_id, received, sent in RE_PEER.findall(value):
+                result["icmp_peers"].append({
+                    "unit_id": unit_id,
+                    "received": int(received),
+                    "transmitted": int(sent),
+                })
+
+    match = RE_HOSTNAME.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["hostname"] = OK if match.group(1) == OK else FAILED
+        result["reported_hostname"] = match.group(2)
+
+    match = RE_DNS_OK.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["dns"] = OK
+    for match in RE_DNS_BAD.finditer(message):
+        spans.append(match.span())
+        result["checks"]["dns"] = FAILED
+        for unit_id in RE_ID.findall(match.group(2)):
+            result["dns_peers"].append({"kind": match.group(1), "unit_id": unit_id})
+
+    match = RE_MTU_OK.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["mtu"] = OK
+        result["required_mtu"] = int(match.group(1))
+    match = RE_MTU_BAD.search(message)
+    if match:
+        spans.append(match.span())
+        result["checks"]["mtu"] = FAILED
+        result["required_mtu"] = int(match.group(1))
+        result["iface_mtu"] = int(match.group(2))
+
+    for pattern in (RE_NET_MTU_OK, RE_NET_MTU_BAD, RE_NET_MTU_CHECK,
+                    RE_IPERF_LEADER, RE_SPEED, RE_SPEED_BAD, RE_MIN_SPEED_BAD):
+        match = pattern.search(message)
+        if match:
+            spans.append(match.span())
+            if pattern is RE_NET_MTU_BAD or pattern is RE_NET_MTU_CHECK:
+                result["detail"]["net_mtu"] = match.group(0).lstrip(", ")
+
+    result["unrecognized"] = _blank(spans, message)
+    if not spans:
+        result["form"] = "unparsed"
+    elif result["unrecognized"]:
+        result["form"] = "partial"
+    return result
+
+
+# --------------------------------------------------------------------------
+# Stage 1b: status document
+# --------------------------------------------------------------------------
+
+def _zone(hardware):
+    for token in (hardware or "").split():
+        if token.startswith("availability-zone="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def load_status(document, source_name):
+    """Build the machine inventory, spaces and per-unit check results."""
+    machines = {}
+    for machine_id, machine in (document.get("machines") or {}).items():
+        machines[machine_id] = {
+            "id": machine_id,
+            "hostname": machine.get("hostname") or "machine-%s" % machine_id,
+            "display_name": machine.get("display-name"),
+            "dns_name": machine.get("dns-name"),
+            "zone": _zone(machine.get("hardware")),
+        }
+
+    spaces = {}
+    unparsed = 0
+    forms = set()
+    for app_name, app in (document.get("applications") or {}).items():
+        if not app_name.startswith("magpie-"):
+            continue
+        space = app_name[len("magpie-"):]
+        units = {}
+        for unit_name, unit in (app.get("units") or {}).items():
+            unit_id = unit_name.split("/")[-1]
+            status = unit.get("workload-status") or {}
+            parsed = parse_message(status.get("message") or "")
+            forms.add(parsed["form"])
+            if parsed["form"] == "unparsed":
+                unparsed += 1
+            machine_id = unit.get("machine")
+            machine = machines.get(machine_id)
+            units[unit_id] = {
+                "unit": unit_name,
+                "unit_id": unit_id,
+                "machine": machine_id,
+                "hostname": machine["hostname"] if machine else "?machine-%s" % machine_id,
+                "zone": machine["zone"] if machine else None,
+                "state": status.get("current"),
+                "role": "leader" if parsed["form"] == "leader-status" else "unit",
+                "form": parsed["form"],
+                "checks": parsed["checks"],
+                "detail": parsed["detail"],
+                "icmp_peers": parsed["icmp_peers"],
+                "dns_peers": parsed["dns_peers"],
+                "required_mtu": parsed["required_mtu"],
+                "iface_mtu": parsed["iface_mtu"],
+                "reported_hostname": parsed["reported_hostname"],
+                "unrecognized": parsed["unrecognized"],
+                "raw": parsed["raw"],
+            }
+        spaces[space] = {"space": space, "application": app_name, "units": units}
+
+    # Resolve peer identifiers to machines within the same application.
+    for space in spaces.values():
+        units = space["units"]
+        for unit in units.values():
+            for peer in unit["icmp_peers"] + unit["dns_peers"]:
+                target = units.get(peer["unit_id"])
+                peer["resolved"] = target is not None
+                peer["machine"] = target["machine"] if target else None
+                peer["hostname"] = target["hostname"] if target else None
+                peer["zone"] = target["zone"] if target else None
+        mtus = set(u["required_mtu"] for u in units.values() if u["required_mtu"] is not None)
+        space["required_mtu"] = sorted(mtus)[0] if len(mtus) == 1 else None
+
+    charm = "reactive"
+    if forms and forms <= {"ops-charm"}:
+        charm = "ops"
+    elif not forms:
+        charm = "unknown"
+
+    return {
+        "model_name": (document.get("model") or {}).get("name"),
+        "source": source_name,
+        "machines": machines,
+        "spaces": spaces,
+        "charm": charm,
+        "unparsed_messages": unparsed,
+    }
+
+
+# --------------------------------------------------------------------------
+# Stage 1c: iperf CSV
+# --------------------------------------------------------------------------
+
+IPERF_COLUMNS = ("application", "source machine", "target machine", "Mb/s")
+
+ENDPOINT_FIELDS = {
+    "bonds": "bonds",
+    "ports": "ports",
+    "icmp": "icmp",
+    "local_hostname": "hostname",
+    "dns": "dns",
+    "mtu": "mtu",
+}
+
+
+def _endpoint_checks(row, prefix):
+    checks = {}
+    for column, name in ENDPOINT_FIELDS.items():
+        raw = row.get("%s %s" % (prefix, column))
+        if raw is None:
+            checks[name] = ABSENT
+            continue
+        value = raw.strip()
+        if value.startswith(OK):
+            checks[name] = OK
+        elif value.startswith(FAILED) or "failed" in value:
+            checks[name] = FAILED
+        elif not value:
+            checks[name] = ABSENT
+        else:
+            checks[name] = ABSENT
+    return checks
+
+
+def load_iperf(path):
+    """Read the Magpie iperf CSV into per-pair measurements."""
+    result = {"path": path, "format_ok": True, "malformed_rows": 0,
+              "measurements": [], "topology": {}}
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        missing = [c for c in IPERF_COLUMNS if c not in fieldnames]
+        if missing:
+            result["format_ok"] = False
+            result["missing_columns"] = missing
+            return result
+        for row in reader:
+            raw_speed = (row.get("Mb/s") or "").strip()
+            try:
+                mbps = float(raw_speed)
+            except ValueError:
+                result["malformed_rows"] += 1
+                continue
+            app = row.get("application") or ""
+            result["measurements"].append({
+                "space": app[len("magpie-"):] if app.startswith("magpie-") else app,
+                "application": app,
+                "source_unit": row.get("source unit"),
+                "source": row.get("source machine"),
+                "source_ip": row.get("src_ip"),
+                "source_interface": row.get("src_interface"),
+                "source_mac": row.get("src_mac"),
+                "target_unit": row.get("target unit"),
+                "target": row.get("target machine"),
+                "target_ip": row.get("target_ip"),
+                "target_mac": row.get("target_mac"),
+                "mbps": mbps,
+                "error": row.get("error") or "",
+                "required_mtu": _int_or_none(row.get("target_unit required_mtu")),
+                "target_checks": _endpoint_checks(row, "target_unit"),
+                "source_checks": _endpoint_checks(row, "src_unit"),
+            })
+
+    by_space = {}
+    for measurement in result["measurements"]:
+        by_space.setdefault(measurement["space"], set()).add(measurement["source"])
+    for space, sources in by_space.items():
+        if len(sources) == 1:
+            result["topology"][space] = {"kind": "star", "source": sorted(sources)[0]}
+        else:
+            result["topology"][space] = {"kind": "mesh", "sources": sorted(sources)}
+    return result
+
+
+def _int_or_none(value):
+    try:
+        return int((value or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Coverage
+# --------------------------------------------------------------------------
+
+def build_coverage(status, iperf):
+    units = [u for space in status["spaces"].values() for u in space["units"].values()
+             if u["role"] != "leader" or u["checks"]["icmp"] != ABSENT]
+    measuring = [u for space in status["spaces"].values() for u in space["units"].values()
+                 if u["checks"]["icmp"] in (OK, FAILED)]
+    skipping = [u for space in status["spaces"].values() for u in space["units"].values()
+                if u["checks"]["icmp"] == ABSENT and u["role"] != "leader"]
+
+    if measuring and not skipping:
+        icmp = "complete"
+    elif not measuring:
+        icmp = "none"
+    else:
+        per_space = {}
+        for space_name, space in status["spaces"].items():
+            per_space[space_name] = sum(
+                1 for u in space["units"].values() if u["checks"]["icmp"] in (OK, FAILED))
+        icmp = "leader-only" if set(per_space.values()) == {1} else "partial"
+
+    coverage = {
+        "machines": len(status["machines"]),
+        "spaces": len(status["spaces"]),
+        "units": len(units),
+        "icmp": icmp,
+        "unparsed_messages": status["unparsed_messages"],
+        "charm": status["charm"],
+        "iperf": {"present": iperf is not None},
+    }
+    if iperf is not None:
+        coverage["iperf"].update({
+            "path": iperf["path"],
+            "discovered": iperf.get("discovered", False),
+            "format_ok": iperf["format_ok"],
+            "malformed_rows": iperf["malformed_rows"],
+            "measurements": len(iperf["measurements"]),
+            "topology": iperf["topology"],
+        })
+    return coverage
+
+
+# --------------------------------------------------------------------------
+# Stage 2: diagnosis
+# --------------------------------------------------------------------------
+
+def _verdict(kind, title, hosts, spaces, evidence, reasoning, tier=1):
+    return {
+        "kind": kind,
+        "title": title,
+        "hosts": sorted(set(hosts)),
+        "spaces": sorted(set(spaces)),
+        "evidence": list(evidence),
+        "reasoning": reasoning,
+        "tier": tier,
+    }
+
+
+def _icmp_failures(status):
+    """Yield (space, source_unit, peer) for every reported ICMP failure."""
+    for space_name, space in sorted(status["spaces"].items()):
+        for unit in sorted(space["units"].values(), key=lambda u: int(u["unit_id"])):
+            for peer in unit["icmp_peers"]:
+                yield space_name, unit, peer
+
+
+def diagnose(model):
+    status = model["status"]
+    iperf = model["iperf"]
+    verdicts = []
+
+    if status["charm"] == "ops":
+        return [_verdict(
+            "unsupported-charm",
+            "Deployed Magpie charm is not supported",
+            [], sorted(status["spaces"]),
+            ["unit messages take the form 'Ready, with N peers'"],
+            "That form comes from the rewritten ops-based Magpie charm, which "
+            "publishes results through actions rather than in the status "
+            "message. No check results can be read from this model, so its "
+            "health is unknown rather than good.",
+            tier=0)]
+
+    failures = list(_icmp_failures(status))
+    spaces_with_failures = sorted(set(space for space, _, _ in failures))
+
+    az_spaces = _diagnose_availability_zone(status, failures, verdicts)
+    mtu_spaces = _diagnose_mtu_class(status, spaces_with_failures, verdicts)
+    handled = az_spaces | mtu_spaces
+    space_wide = _diagnose_space_wide(status, failures, handled, verdicts)
+    _diagnose_host_connectivity(status, failures, handled | space_wide, verdicts)
+    _diagnose_asymmetry(status, failures, verdicts)
+    reported = _diagnose_local_checks(status, verdicts)
+    _diagnose_dns(status, verdicts)
+    _diagnose_unresolved_peers(status, verdicts)
+    if iperf is not None and iperf["format_ok"]:
+        _diagnose_endpoint_checks(iperf, reported, verdicts)
+        _diagnose_throughput(iperf, verdicts)
+
+    verdicts.sort(key=lambda v: (v["tier"],
+                                 -(max(len(v["spaces"]), 1) * max(len(v["hosts"]), 1)),
+                                 -len(v["spaces"]), -len(v["hosts"]), v["title"]))
+    return verdicts
+
+
+def _participating(space):
+    return [u for u in space["units"].values() if u["role"] != "leader"]
+
+
+def _diagnose_space_wide(status, failures, skip, verdicts):
+    handled = set()
+    for space_name, space in sorted(status["spaces"].items()):
+        if space_name in skip:
+            continue
+        sources = set(u["unit_id"] for s, u, _ in failures if s == space_name)
+        participants = _participating(space)
+        if not participants or len(sources) < 2:
+            continue
+        if len(sources) != len(participants):
+            continue
+        other_spaces_clean = all(
+            not any(s == other for s, _, _ in failures)
+            for other in status["spaces"] if other != space_name)
+        if not other_spaces_clean:
+            continue
+        hosts = sorted(set(u["hostname"] for s, u, _ in failures if s == space_name))
+        evidence = ["%s: every participating unit reports ICMP failures (%d of %d)"
+                    % (space_name, len(sources), len(participants))]
+        for _, unit, peer in [f for f in failures if f[0] == space_name][:6]:
+            evidence.append("  %s -> %s  %d/%d packets" % (
+                unit["hostname"], peer["hostname"] or "unit %s" % peer["unit_id"],
+                peer["received"], peer["transmitted"]))
+        verdicts.append(_verdict(
+            "space-wide", "Network space %s is failing on every host" % space_name,
+            hosts, [space_name], evidence,
+            "All participating hosts fail within this space while other spaces "
+            "on the same hosts are clean, so the fault belongs to the space "
+            "rather than to any individual host. Check the VLAN, the switch "
+            "configuration and the Juju space binding."))
+        handled.add(space_name)
+    return handled
+
+
+def _diagnose_host_connectivity(status, failures, skip, verdicts):
+    by_host = {}
+    for space_name, unit, peer in failures:
+        if space_name in skip:
+            continue
+        by_host.setdefault(unit["hostname"], {}).setdefault(space_name, []).append((unit, peer))
+    for host, spaces in sorted(by_host.items()):
+        minority = []
+        for space_name in spaces:
+            space = status["spaces"][space_name]
+            sources = set(u["unit_id"] for s, u, _ in failures if s == space_name)
+            if len(sources) < len(_participating(space)):
+                minority.append(space_name)
+        if len(minority) < 2:
+            continue
+        evidence = []
+        for space_name in sorted(minority):
+            for unit, peer in spaces[space_name]:
+                evidence.append("%s: %s -> %s  %d/%d packets" % (
+                    space_name, unit["hostname"],
+                    peer["hostname"] or "unit %s" % peer["unit_id"],
+                    peer["received"], peer["transmitted"]))
+        verdicts.append(_verdict(
+            "host-connectivity", "Host %s fails to reach peers in several spaces" % host,
+            [host], minority, evidence,
+            "This host fails in %d spaces while its peers in those same spaces "
+            "do not, which points at the host rather than at the spaces. Check "
+            "its interfaces, bonds and any host firewall."
+            % len(minority)))
+
+
+def _diagnose_mtu_class(status, spaces_with_failures, verdicts):
+    if not spaces_with_failures:
+        return set()
+    failing_mtus = set(status["spaces"][s].get("required_mtu") for s in spaces_with_failures)
+    healthy = [s for s in status["spaces"] if s not in spaces_with_failures]
+    healthy_mtus = set(status["spaces"][s].get("required_mtu") for s in healthy)
+    if None in failing_mtus or not healthy or len(failing_mtus) != 1:
+        return set()
+    if failing_mtus & healthy_mtus:
+        return set()
+    mtu = sorted(failing_mtus)[0]
+    hosts = sorted(set(u["hostname"] for s in spaces_with_failures
+                       for u in status["spaces"][s]["units"].values()
+                       if u["icmp_peers"]))
+    evidence = ["failing spaces require MTU %d: %s" % (mtu, ", ".join(sorted(spaces_with_failures)))]
+    for space in sorted(healthy):
+        evidence.append("healthy space %s requires MTU %s"
+                        % (space, status["spaces"][space].get("required_mtu")))
+    verdicts.append(_verdict(
+        "mtu-class", "Failures are confined to the spaces requiring MTU %d" % mtu,
+        hosts, sorted(spaces_with_failures), evidence,
+        "Every failing space requires MTU %d and every healthy space does not, "
+        "which is the signature of jumbo frames not being configured end to "
+        "end. Check the MTU on the switch ports and on every interface in the "
+        "path, not just on the hosts." % mtu))
+    return set(spaces_with_failures)
+
+
+def _diagnose_availability_zone(status, failures, verdicts):
+    pairs = [(unit, peer, space) for space, unit, peer in failures if peer["resolved"]]
+    if not pairs:
+        return set()
+    zones_known = all(u["zone"] and p["zone"] for u, p, _ in pairs)
+    if not zones_known:
+        return set()
+    if not all(u["zone"] != p["zone"] for u, p, _ in pairs):
+        return set()
+
+    # A single host failing towards the other zone is a host problem that looks
+    # like a zone pattern by coincidence. A genuine inter-rack fault shows up
+    # from sources on both sides of the boundary.
+    source_zones = set(u["zone"] for u, _, _ in pairs)
+    sources = set(u["hostname"] for u, _, _ in pairs)
+    if len(sources) < 2 or len(source_zones) < 2:
+        return set()
+
+    # Every failing pair crosses zones. Confirm same-zone pairs were measured.
+    same_zone_measured = False
+    for space in status["spaces"].values():
+        units = [u for u in space["units"].values() if u["checks"]["icmp"] in (OK, FAILED)]
+        for unit in units:
+            for other in units:
+                if other["unit_id"] != unit["unit_id"] and other["zone"] == unit["zone"]:
+                    same_zone_measured = True
+    if not same_zone_measured:
+        return set()
+
+    zones = sorted(set(u["zone"] for u, _, _ in pairs) | set(p["zone"] for _, p, _ in pairs))
+    spaces = sorted(set(space for _, _, space in pairs))
+    hosts = sorted(set(u["hostname"] for u, _, _ in pairs))
+    evidence = ["every failing pair crosses an availability zone boundary (%s)"
+                % " and ".join(zones)]
+    for unit, peer, space in pairs[:6]:
+        evidence.append("  %s: %s (%s) -> %s (%s)  %d/%d packets" % (
+            space, unit["hostname"], unit["zone"], peer["hostname"], peer["zone"],
+            peer["received"], peer["transmitted"]))
+    evidence.append("same-zone pairs in the same spaces are healthy")
+    verdicts.append(_verdict(
+        "cross-zone", "Failures occur only between availability zones",
+        hosts, spaces, evidence,
+        "Connectivity within each zone is fine and only zone-crossing pairs "
+        "fail, which points at the path between racks rather than at any host. "
+        "Check the inter-rack trunk, its VLAN membership and the routing "
+        "between the zones."))
+    return set(spaces)
+
+
+def _diagnose_asymmetry(status, failures, verdicts):
+    for space_name, space in sorted(status["spaces"].items()):
+        units = space["units"]
+        seen = set()
+        for _, unit, peer in [f for f in failures if f[0] == space_name]:
+            if not peer["resolved"]:
+                continue
+            key = (unit["unit_id"], peer["unit_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            target = units[peer["unit_id"]]
+            reverse_measured = target["checks"]["icmp"] in (OK, FAILED)
+            reverse_failed = any(p["unit_id"] == unit["unit_id"] for p in target["icmp_peers"])
+            if not reverse_measured:
+                verdicts.append(_verdict(
+                    "direction-unknown",
+                    "Direction of the %s to %s failure in %s is unconfirmed"
+                    % (unit["hostname"], target["hostname"], space_name),
+                    [unit["hostname"], target["hostname"]], [space_name],
+                    ["%s -> %s  %d/%d packets" % (unit["hostname"], target["hostname"],
+                                                  peer["received"], peer["transmitted"]),
+                     "%s did not measure ICMP, so the reverse direction is unknown"
+                     % target["hostname"]],
+                    "The reverse direction was not measured, so this cannot be "
+                    "called a one-way failure. Enable ping_mesh_mode to "
+                    "establish the direction."))
+            elif not reverse_failed:
+                verdicts.append(_verdict(
+                    "one-way",
+                    "One-way failure from %s to %s in %s"
+                    % (unit["hostname"], target["hostname"], space_name),
+                    [unit["hostname"], target["hostname"]], [space_name],
+                    ["%s -> %s  %d/%d packets" % (unit["hostname"], target["hostname"],
+                                                  peer["received"], peer["transmitted"]),
+                     "%s -> %s  reaches it" % (target["hostname"], unit["hostname"])],
+                    "Traffic succeeds in one direction and fails in the other, "
+                    "which rules out a plain layer 2 break. Check firewall "
+                    "rules and asymmetric routing on both ends."))
+
+
+CHECK_ADVICE = (
+    ("bonds", "Bond", "Check the bond members, their LACP state and the "
+                      "switch port channel configuration."),
+    ("mtu", "Local MTU", "The interface MTU does not satisfy the MTU required "
+                         "for this space. Check the netplan configuration on "
+                         "the host."),
+    ("ports", "Port description", "LLDP reports a port description that does "
+                                  "not match the host, which usually means the "
+                                  "cable is in the wrong port."),
+    ("hostname", "Local hostname", "The host cannot resolve its own hostname. "
+                                   "Check /etc/hosts and the DNS "
+                                   "configuration."),
+)
+
+
+def _diagnose_endpoint_checks(iperf, reported, verdicts):
+    """Report check failures that appear only in the iperf CSV columns.
+
+    The CSV repeats each endpoint's checks. A failure recorded there but not in
+    any status message would otherwise be parsed and then never shown.
+    """
+    found = {}
+    for measurement in iperf["measurements"]:
+        for role, host in (("target_checks", measurement["target"]),
+                           ("source_checks", measurement["source"])):
+            for name, _, _ in CHECK_ADVICE:
+                if measurement[role].get(name) != FAILED:
+                    continue
+                if (host, name) in reported:
+                    continue
+                found.setdefault((host, name), set()).add(measurement["space"])
+    for (host, name), spaces in sorted(found.items()):
+        label, advice = next((l, a) for n, l, a in CHECK_ADVICE if n == name)
+        verdicts.append(_verdict(
+            "endpoint-%s" % name, "%s check failed on %s" % (label, host),
+            [host], sorted(spaces),
+            ["reported in the iperf results for %s" % ", ".join(sorted(spaces)),
+             "not present in any juju status message, so the status output may "
+             "predate the iperf run"],
+            advice))
+
+
+def _diagnose_local_checks(status, verdicts):
+    reported = set()
+    for name, label, advice in CHECK_ADVICE:
+        affected = {}
+        for space_name, space in sorted(status["spaces"].items()):
+            for unit in space["units"].values():
+                if unit["checks"].get(name) == FAILED:
+                    affected.setdefault(unit["hostname"], []).append((space_name, unit))
+        for host, entries in sorted(affected.items()):
+            evidence = []
+            for space_name, unit in entries:
+                detail = unit["detail"].get(name)
+                if name == "mtu" and unit["required_mtu"] is not None:
+                    detail = "required %s, interface %s" % (unit["required_mtu"],
+                                                            unit["iface_mtu"])
+                evidence.append("%s: %s%s" % (space_name, host,
+                                              "  (%s)" % detail if detail else ""))
+            reported.add((host, name))
+            verdicts.append(_verdict(
+                "local-%s" % name, "%s check failed on %s" % (label, host),
+                [host], [s for s, _ in entries], evidence, advice))
+    return reported
+
+
+def _diagnose_dns(status, verdicts):
+    """Report DNS failures, separating the case where connectivity is clean.
+
+    A DNS failure on a host whose ICMP is clean is a name resolution fault. On a
+    host that also fails ICMP it is reported too, because dropping it would hide
+    evidence, but it is not presented as an independent cause.
+    """
+    clean, alongside = {}, {}
+    for space_name, space in sorted(status["spaces"].items()):
+        for unit in space["units"].values():
+            if unit["checks"]["dns"] != FAILED or not unit["dns_peers"]:
+                continue
+            bucket = alongside if unit["checks"]["icmp"] == FAILED else clean
+            bucket.setdefault(unit["hostname"], []).append((space_name, unit))
+
+    def evidence_for(entries):
+        lines, spaces = [], []
+        for space_name, unit in entries:
+            spaces.append(space_name)
+            for peer in unit["dns_peers"]:
+                lines.append("%s: %s cannot %s-resolve %s" % (
+                    space_name, unit["hostname"], peer["kind"],
+                    peer["hostname"] or "unit %s" % peer["unit_id"]))
+        return lines, spaces
+
+    for host, entries in sorted(clean.items()):
+        lines, spaces = evidence_for(entries)
+        verdicts.append(_verdict(
+            "dns-only", "DNS resolution failing from %s while ICMP is clean" % host,
+            [host], spaces, lines,
+            "Connectivity from this host is fine, so this is a name resolution "
+            "fault rather than a network fault. Check the PTR records and the "
+            "resolver configuration."))
+
+    for host, entries in sorted(alongside.items()):
+        lines, spaces = evidence_for(entries)
+        verdicts.append(_verdict(
+            "dns-with-icmp", "DNS resolution also failing from %s" % host,
+            [host], spaces, lines,
+            "This host fails ICMP as well, so the DNS failures may simply "
+            "follow from the connectivity fault. Fix the connectivity first, "
+            "then re-check DNS rather than treating this as a separate cause."))
+
+
+def _diagnose_unresolved_peers(status, verdicts):
+    """Report peer identifiers that match no unit, rather than dropping them."""
+    unresolved = {}
+    for space_name, space in sorted(status["spaces"].items()):
+        for unit in space["units"].values():
+            for peer in unit["icmp_peers"] + unit["dns_peers"]:
+                if peer.get("resolved"):
+                    continue
+                if "received" in peer:
+                    kind = "an ICMP"
+                else:
+                    kind = "a %s DNS" % peer.get("kind", "")
+                unresolved.setdefault(space_name, []).append(
+                    "%s reported %s failure against unit %s, which is not in %s"
+                    % (unit["hostname"], kind, peer["unit_id"], space["application"]))
+    for space_name, lines in sorted(unresolved.items()):
+        hosts = sorted(set(line.split()[0] for line in lines))
+        verdicts.append(_verdict(
+            "unresolved-peer",
+            "Unresolved peer identifiers in %s" % space_name,
+            hosts, [space_name], lines,
+            "These identifiers cannot be mapped to a machine, so the failures "
+            "they describe cannot be attributed. This usually means the status "
+            "output is stale relative to the units, for example after a "
+            "redeploy. Re-run juju status before trusting this space."))
+
+
+def _diagnose_throughput(iperf, verdicts):
+    by_space_source = {}
+    for measurement in iperf["measurements"]:
+        key = (measurement["space"], measurement["source"])
+        by_space_source.setdefault(key, []).append(measurement)
+
+    outliers = {}
+    observations = []
+    for (space, source), rows in sorted(by_space_source.items()):
+        if len(rows) < 2:
+            continue
+        for row in rows:
+            peers = [r["mbps"] for r in rows if r["target"] != row["target"]]
+            if not peers:
+                continue
+            median = statistics.median(peers)
+            if median <= 0 or row["mbps"] >= OUTLIER_FRACTION * median:
+                continue
+            verified, reason = _common_path_verified(peers, median)
+            if verified:
+                outliers.setdefault(row["target"], []).append((space, row, median, source))
+            else:
+                observations.append((space, source, row, median, reason))
+
+    for host, entries in sorted(outliers.items(), key=lambda kv: -len(kv[1])):
+        evidence = []
+        spaces = []
+        for space, row, median, source in sorted(entries):
+            spaces.append(space)
+            evidence.append("%s: %s -> %s  %.0f Mb/s against a peer median of %.0f"
+                            % (space, source, host, row["mbps"], median))
+            evidence.append("  source interface %s, target %s (%s)"
+                            % (row["source_interface"], row["target_ip"], row["target_mac"]))
+        verdicts.append(_verdict(
+            "throughput-host", "Host %s is far below its peers in %s"
+            % (host, _plural(len(entries), "space")),
+            [host], spaces, evidence,
+            "The same source reaches at least %d other targets at the peer rate "
+            "over the same interface, so its common path is healthy and the "
+            "fault is attributed to %s. Check the bond member count and link "
+            "speed on that host: cat /proc/net/bonding/<bond> and ethtool "
+            "<member>." % (MIN_PEERS_FOR_ATTRIBUTION, host)))
+
+    for space, source, row, median, reason in observations:
+        verdicts.append(_verdict(
+            "throughput-observation",
+            "Throughput from %s in %s is uneven" % (source, space),
+            [source], [space],
+            ["%s -> %s  %.0f Mb/s against a peer median of %.0f"
+             % (source, row["target"], row["mbps"], median),
+             "source interface %s" % row["source_interface"],
+             reason],
+            "No target host is named as the cause: the measurements are taken "
+            "from a single source, and its common path could not be shown "
+            "healthy. Re-run the iperf action from another leader before "
+            "attributing this to any host."))
+
+
+def _common_path_verified(peers, median):
+    """Can underperformance be attributed to the target rather than the source?"""
+    at_rate = [p for p in peers if p >= PEER_CONSISTENCY * median]
+    if len(at_rate) < MIN_PEERS_FOR_ATTRIBUTION:
+        return False, ("only %d peer measurement%s at the peer rate, which is too "
+                       "few to establish that the source path is healthy"
+                       % (len(at_rate), "" if len(at_rate) == 1 else "s"))
+    if min(peers) < PEER_CONSISTENCY * max(peers):
+        return False, ("the remaining peers are themselves scattered (%.0f to %.0f "
+                       "Mb/s), so the source path cannot be shown healthy"
+                       % (min(peers), max(peers)))
+    return True, ""
+
+
+# --------------------------------------------------------------------------
+# Stage 3: rendering
+# --------------------------------------------------------------------------
+
+RED, YELLOW, GREEN, BOLD, RESET = (
+    "\033[0;31m", "\033[1;33m", "\033[0;32m", "\033[1m", "\033[0m")
+
+
+class Painter(object):
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def __call__(self, text, color):
+        if not self.enabled:
+            return text
+        return "%s%s%s" % (color, text, RESET)
+
+
+def _plural(count, noun, suffix="s"):
+    return "%d %s%s" % (count, noun, "" if count == 1 else suffix)
+
+
+def _coverage_lines(coverage):
+    lines = []
+    inputs = ["status: %s" % coverage["source"]]
+    iperf = coverage["iperf"]
+    if iperf["present"] and iperf.get("format_ok"):
+        label = "iperf: %s" % iperf["path"]
+        if iperf.get("discovered"):
+            label += " (found beside the status file)"
+        inputs.append(label)
+    elif iperf["present"]:
+        inputs.append("iperf: %s (not in the expected format, ignored)" % iperf["path"])
+    else:
+        inputs.append("iperf: not supplied, no throughput data")
+    lines.append("inputs   " + " | ".join(inputs))
+
+    icmp_label = {
+        "complete": "measured on every unit",
+        "leader-only": "measured from the leader only",
+        "partial": "measured on some units only",
+        "none": "not measured on any unit",
+    }[coverage["icmp"]]
+    scope = "scope    %s, %s | icmp: %s" % (
+        _plural(coverage["machines"], "machine"),
+        _plural(coverage["spaces"], "space"), icmp_label)
+    lines.append(scope)
+
+    if iperf["present"] and iperf.get("format_ok"):
+        topologies = iperf.get("topology") or {}
+        stars = sorted(set(t["source"] for t in topologies.values() if t["kind"] == "star"))
+        if stars:
+            shape = "star from %s" % ", ".join(stars)
+        elif topologies:
+            shape = "mesh"
+        else:
+            shape = "no measurements"
+        lines.append("iperf    %d measurements, %s" % (iperf.get("measurements", 0), shape))
+
+    counts = "quality  %s" % _plural(coverage["unparsed_messages"], "unparsed message")
+    if iperf["present"] and iperf.get("format_ok"):
+        counts += ", %s" % _plural(iperf.get("malformed_rows", 0), "malformed row")
+    lines.append(counts)
+    return lines
+
+
+def render_text(model, verdicts, paint):
+    coverage = model["coverage"]
+    status = model["status"]
+    out = []
+    out.append(paint("NETWORK DOCTOR", BOLD) + "   model: %s" % (status["model_name"] or "unknown"))
+    out.extend(_coverage_lines(coverage))
+    out.append("")
+
+    if verdicts:
+        for index, verdict in enumerate(verdicts, 1):
+            color = RED if verdict["tier"] == 0 or verdict["kind"] in (
+                "space-wide", "host-connectivity", "mtu-class", "cross-zone",
+                "throughput-host", "unsupported-charm") else YELLOW
+            out.append(paint("[%d] %s" % (index, verdict["title"]), color))
+            if verdict["spaces"]:
+                out.append("    spaces     %s" % ", ".join(verdict["spaces"]))
+            if verdict["hosts"]:
+                out.append("    hosts      %s" % ", ".join(verdict["hosts"]))
+            out.append("    evidence")
+            for line in verdict["evidence"]:
+                out.append("      %s" % line)
+            out.append("    reading")
+            for line in _wrap(verdict["reasoning"], 68):
+                out.append("      %s" % line)
+            out.append("")
+    else:
+        caveats = []
+        if coverage["icmp"] == "none":
+            caveats.append("Every unit reports 'icmp skipped', so this result says "
+                           "nothing about reachability. Enable ping_mesh_mode on "
+                           "the Magpie charm.")
+        elif coverage["icmp"] != "complete":
+            caveats.append("ICMP was %s, so unmeasured pairs are unknown rather "
+                           "than healthy." % {
+                               "leader-only": "measured from the leader only",
+                               "partial": "measured on some units only",
+                           }[coverage["icmp"]])
+        if coverage["unparsed_messages"]:
+            count = coverage["unparsed_messages"]
+            caveats.append("%d status message%s could not be parsed and %s listed "
+                           "below, so the checks %s carried were not evaluated."
+                           % (count, "" if count == 1 else "s",
+                              "is" if count == 1 else "are",
+                              "it" if count == 1 else "they"))
+        if caveats:
+            out.append(paint("No faults found in what could be measured.", YELLOW))
+            for caveat in caveats:
+                out.extend(_wrap(caveat, 72))
+        else:
+            out.append(paint("No faults found.", GREEN))
+            out.append("ICMP was measured on every unit and every message parsed.")
+        out.append("")
+
+    unparsed = [(space_name, unit) for space_name, space in sorted(status["spaces"].items())
+                for unit in space["units"].values() if unit["form"] in ("unparsed", "partial")]
+    if unparsed:
+        out.append(paint("UNRECOGNIZED STATUS MESSAGES", YELLOW))
+        for space_name, unit in unparsed:
+            out.append("  %s %s: %s" % (space_name, unit["unit"],
+                                        unit["unrecognized"] or unit["raw"]))
+        out.append("")
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _wrap(text, width):
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = (current + " " + word).strip()
+    if current:
+        lines.append(current)
+    return lines
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_model(status_document, source_name, iperf):
+    status = load_status(status_document, source_name)
+    model = {"status": status, "iperf": iperf}
+    coverage = build_coverage(status, iperf)
+    coverage["source"] = source_name
+    model["coverage"] = coverage
+    return model
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="network-doctor",
+        description="Diagnose Juju Magpie network results.")
+    parser.add_argument("status", nargs="?", default=None,
+                        help="juju status JSON file; reads standard input when omitted")
+    parser.add_argument("--iperf", default=None,
+                        help="Magpie iperf CSV; looked for beside the status file when omitted")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit the normalized model and verdicts as JSON")
+    parser.add_argument("--no-color", action="store_true",
+                        help="never emit ANSI color, even on a terminal")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.status is None:
+        source_name = "<stdin>"
+        raw = sys.stdin.read()
+    else:
+        if not os.path.isfile(args.status):
+            sys.stderr.write("error: status file not found: %s\n" % args.status)
+            return 1
+        source_name = args.status
+        with open(args.status) as handle:
+            raw = handle.read()
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        sys.stderr.write("error: %s is not valid JSON: %s\n" % (source_name, exc))
+        return 1
+    if not isinstance(document, dict) or "applications" not in document:
+        sys.stderr.write("error: %s does not look like juju status output\n" % source_name)
+        return 1
+
+    iperf_path, discovered = args.iperf, False
+    if iperf_path is None and args.status is not None:
+        sibling = os.path.join(os.path.dirname(os.path.abspath(args.status)), "iperf.csv")
+        if os.path.isfile(sibling):
+            iperf_path, discovered = sibling, True
+    iperf = None
+    if iperf_path is not None:
+        if not os.path.isfile(iperf_path):
+            sys.stderr.write("error: iperf file not found: %s\n" % iperf_path)
+            return 1
+        iperf = load_iperf(iperf_path)
+        iperf["discovered"] = discovered
+
+    model = build_model(document, source_name, iperf)
+    verdicts = diagnose(model)
+
+    if args.as_json:
+        sys.stdout.write(json.dumps(
+            {"coverage": model["coverage"], "model": model["status"],
+             "measurements": iperf["measurements"] if iperf else [],
+             "verdicts": verdicts},
+            indent=2, sort_keys=True) + "\n")
+    else:
+        color = sys.stdout.isatty() and not args.no_color
+        sys.stdout.write(render_text(model, verdicts, Painter(color)))
+
+    return 2 if verdicts else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

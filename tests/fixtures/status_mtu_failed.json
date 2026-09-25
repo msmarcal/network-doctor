@@ -1,0 +1,69 @@
+{
+  "applications": {
+    "magpie-ceph-access-space": {
+      "application-status": {
+        "current": "blocked",
+        "message": "ports ok, bonds ok, icmp ok, local hostname ok (node-04), dns ok, local mtu failed,         required: 9000, iface: 1500"
+      },
+      "units": {
+        "magpie-ceph-access-space/0": {
+          "machine": "3",
+          "workload-status": {
+            "current": "blocked",
+            "message": "ports ok, bonds ok, icmp ok, local hostname ok (node-04), dns ok, local mtu failed,         required: 9000, iface: 1500"
+          }
+        },
+        "magpie-ceph-access-space/1": {
+          "machine": "0",
+          "workload-status": {
+            "current": "active",
+            "message": "ports ok, bonds ok, icmp ok, local hostname ok (node-01), dns ok, local mtu ok, required:             9000"
+          }
+        },
+        "magpie-ceph-access-space/2": {
+          "machine": "1",
+          "workload-status": {
+            "current": "active",
+            "message": "ports ok, bonds ok, icmp ok, local hostname ok (node-02), dns ok, local mtu ok, required:             9000"
+          }
+        },
+        "magpie-ceph-access-space/3": {
+          "machine": "2",
+          "workload-status": {
+            "current": "active",
+            "message": "ports ok, bonds ok, icmp ok, local hostname ok (node-03), dns ok, local mtu ok, required:             9000"
+          }
+        }
+      }
+    }
+  },
+  "machines": {
+    "0": {
+      "display-name": "node-01",
+      "dns-name": "10.0.1.10",
+      "hardware": "arch=amd64 cores=8 mem=32768M availability-zone=z1",
+      "hostname": "node-01"
+    },
+    "1": {
+      "display-name": "node-02",
+      "dns-name": "10.0.1.11",
+      "hardware": "arch=amd64 cores=8 mem=32768M availability-zone=z1",
+      "hostname": "node-02"
+    },
+    "2": {
+      "display-name": "node-03",
+      "dns-name": "10.0.1.12",
+      "hardware": "arch=amd64 cores=8 mem=32768M availability-zone=z2",
+      "hostname": "node-03"
+    },
+    "3": {
+      "display-name": "node-04",
+      "dns-name": "10.0.1.13",
+      "hardware": "arch=amd64 cores=8 mem=32768M availability-zone=z2",
+      "hostname": "node-04"
+    }
+  },
+  "model": {
+    "name": "magpie"
+  }
+}
